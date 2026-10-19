@@ -1,0 +1,41 @@
+# TEMPLATE: DB-backed suites where a skipped test fails the job. Not used by this repo's own CI.
+# A suite that needs Postgres must never pass green by not running: --strict-skips fails on any
+# skip, and the JUnit gate fails on a missing, empty or all-skipped report.
+name: db-suites (example)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  migrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No dependencies installed: the check reads revision ids with ast and imports nothing.
+      - run: python3 scripts/check_migrations.py migrations
+
+  db-tests:
+    needs: migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv pip install --system --compile-bytecode -e ".[dev]"
+      - name: Run every DB suite (found by grep, so none can be left out)
+        env:
+          DATABASE_URL: postgresql://postgres:ci-only@localhost:5432/postgres
+        run: |
+          suites=$(grep -rl "pytest.mark.db" tests)
+          pytest -q --strict-skips --junitxml=report.xml $suites
+      - name: Fail on a missing, empty or all-skipped report
+        if: always()
+        run: python3 scripts/check_junit.py report.xml --max-skips 0

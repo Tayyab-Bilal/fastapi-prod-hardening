@@ -1,0 +1,72 @@
+# TEMPLATE: copy to your service repo and adapt paths/names. Not used by this repo's own CI.
+# Idea: only rebuild the real Docker image when dependencies changed; otherwise reuse a cached
+# dependency directory and run the tests in a slim container with no network.
+name: change-aware-ci (example)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *"   # nightly: always exercise the real image
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.filter.outputs.deps == 'true' || github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'ci:no-cache') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            deps:
+              - 'requirements*.txt'
+              - 'Dockerfile'
+
+  test-cached:
+    needs: changes
+    if: needs.changes.outputs.full != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # Dependencies live outside the checkout so the cache key is the requirements hash only, and so
+      # pytest does not collect the dependencies' own test suites.
+      # --compile-bytecode: read-only deps would otherwise be recompiled by every test worker.
+      - uses: actions/cache@v4
+        id: deps
+        with:
+          path: /opt/ci-deps
+          key: deps-py312-${{ hashFiles('requirements*.txt') }}
+      - if: steps.deps.outputs.cache-hit != 'true'
+        run: uv pip install --compile-bytecode --python-version 3.12 --target /opt/ci-deps -r requirements.txt -r requirements-dev.txt
+      - name: Test in a slim container, no network
+        run: |
+          mkdir -p out
+          docker run --rm --network none \
+            -v "$PWD":/app:ro -v "$PWD/out":/out -v /opt/ci-deps:/deps:ro \
+            -e PYTHONPATH=/deps:/app/src -w /app \
+            python:3.12-slim python -m pytest -q -p no:cacheprovider --junitxml=/out/report.xml
+      - name: Fail on a missing, empty or all-skipped report
+        if: always()
+        run: python3 scripts/check_junit.py out/report.xml
+
+  test-full-image:
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - run: docker build -t app:ci .
+      - name: Test inside the real image, no network
+        run: |
+          mkdir -p out
+          docker run --rm --network none -v "$PWD/out":/out app:ci \
+            python -m pytest -q -p no:cacheprovider --junitxml=/out/report.xml
+      - name: Fail on a missing, empty or all-skipped report
+        if: always()
+        run: python3 scripts/check_junit.py out/report.xml
